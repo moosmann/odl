@@ -21,12 +21,17 @@
 from __future__ import print_function, division, absolute_import
 from future import standard_library
 standard_library.install_aliases()
-from builtins import next, object, range
+from builtins import next, object, range, super
+import numpy as np
 
 # ODL imports
-from odl.operator.operator import OperatorComp, OperatorSum
+from odl.set.pspace import ProductSpace
+from odl.operator.operator import OperatorComp, OperatorSum, Operator
 from odl.operator.default_ops import IdentityOperator
 
+# pylint: disable=invalid-name, too-many-arguments
+# pylint: disable=abstract-method
+#pylint: disable=E1004
 
 class StorePartial(object):
     """ Simple object for storing all partial results of the solvers
@@ -37,7 +42,10 @@ class StorePartial(object):
     def send(self, result):
         """ append result to results list
         """
-        self.results.append(result.copy())
+        try:
+            self.results.append(result.copy())
+        except AttributeError:
+            self.results.append(result)
 
     def __iter__(self):
         return self.results.__iter__()
@@ -106,7 +114,7 @@ def conjugate_gradient(op, x, rhs, niter=1, partial=None):
     """
     if op.domain != op.range:
         raise TypeError('Operator needs to be self adjoint')
-    
+
     r = op(x)
     r.lincomb(1, rhs, -1, r)       # r = rhs - A x
     p = r.copy()
@@ -269,6 +277,380 @@ def quasi_newton(op, x, line_search, niter=1, partial=None):
 
         if partial is not None:
             partial.send(x)
+
+
+def partial_derivative(f, axis=0, voxel_size=1.0, edge_order=2,
+                       zero_padding=False):
+    """Calculates the partial derivative of 'f' along direction of 'axis'.
+    The number of voxels is maintained. Assuming (implicit) zero padding
+    central differences are used on the interior and on endpoints. Otherwise
+    either one-sided differences differences are used. In the latter case
+    first-order accuracy can be triggered on endpoints with parameter
+    'edge_order'. Assuming zero padding avoids inconsistencies with the
+    'Gradient' operator and its adjoint 'Divergence' which occur when using
+    one-sides differences on endpoint (no padding).
+
+    >>> x = np.arange(10, dtype=float)
+    >>> partial_derivative(x)
+    array([ 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.])
+    >>> partial_derivative(x, voxel_size=0.5)
+    array([ 2.,  2.,  2.,  2.,  2.,  2.,  2.,  2.,  2.,  2.])
+    >>> partial_derivative(x, voxel_size=1.0, zero_padding=True)
+    array([ 0.5,  1. ,  1. ,  1. ,  1. ,  1. ,  1. ,  1. ,  1. , -4. ])
+    >>> dx1 = partial_derivative(np.sin(x/10*np.pi), edge_order=1)
+    >>> dx2 = partial_derivative(np.sin(x/10*np.pi), edge_order=2)
+    >>> np.array_equal(dx1[1:-1], dx2[1:-1])
+    True
+    >>> dx1[0] == dx2[0]
+    False
+    >>> dx1[-1] == dx2[-1]
+    False
+    >>> n = 5
+    >>> x = np.arange(n, dtype=float)
+    >>> x = x * x.reshape((n,1))
+    >>> partial_derivative(x, 0)
+    array([[-0.,  1.,  2.,  3.,  4.],
+           [ 0.,  1.,  2.,  3.,  4.],
+           [ 0.,  1.,  2.,  3.,  4.],
+           [ 0.,  1.,  2.,  3.,  4.],
+           [ 0.,  1.,  2.,  3.,  4.]])
+    >>> partial_derivative(x, 1)
+    array([[-0.,  0.,  0.,  0.,  0.],
+           [ 1.,  1.,  1.,  1.,  1.],
+           [ 2.,  2.,  2.,  2.,  2.],
+           [ 3.,  3.,  3.,  3.,  3.],
+           [ 4.,  4.,  4.,  4.,  4.]])
+    >>> try:
+    ...    partial_derivative(x, 2)
+    ... except IndexError, e:
+    ...    print(e)
+    Axis paramater (2) exceeds number of dimensions (2).
+    """
+
+    f_data = np.asanyarray(f)
+    nd = f_data.ndim
+
+    # create slice objects --- initially all are [:, :, ..., :]
+    # noinspection PyTypeChecker
+    slice1 = [slice(None)] * nd
+    # noinspection PyTypeChecker
+    slice2 = [slice(None)] * nd
+    # noinspection PyTypeChecker
+    slice3 = [slice(None)] * nd
+    # noinspection PyTypeChecker
+    slice4 = [slice(None)] * nd
+
+    try:
+        if f_data.shape[axis] < 2:
+            raise ValueError("Shape of array too small to calculate a "
+                             "numerical gradient, at least two elements are "
+                             "required.")
+    except IndexError:
+        raise IndexError("Axis paramater ({0}) exceeds number of dimensions "
+                         "({1}).".format(axis, nd))
+
+    out = np.empty_like(f_data)
+
+    # Numerical differentiation: 2nd order interior
+    slice1[axis] = slice(1, -1)
+    slice2[axis] = slice(2, None)
+    # noinspection PyTypeChecker
+    slice3[axis] = slice(None, -2)
+    # 1D equivalent -- out[1:-1] = (y[2:] - y[:-2])/2.0
+    out[slice1] = (f_data[slice2] - f_data[slice3]) / 2.0
+
+    # central differences
+    if zero_padding:
+        # Assume zeros for indices outside the volume
+
+        # 1D equivalent -- out[0] = (y[1] - 0)/2.0
+        slice1[axis] = 0
+        slice2[axis] = 1
+        out[slice1] = f_data[slice2] / 2.0
+
+        # 1D equivalent -- out[-1] = (0 - y[-2])/2.0
+        slice1[axis] = -1
+        slice3[axis] = -2
+        out[slice1] = - f_data[slice3] / 2.0
+
+    # one-side differences
+    else:
+        # Numerical differentiation: 1st order edges
+        if f_data.shape[axis] == 2 or edge_order == 1:
+
+            slice1[axis] = 0
+            slice2[axis] = 1
+            slice3[axis] = 0
+            # 1D equivalent -- out[0] = (y[1] - y[0])
+            out[slice1] = (f_data[slice2] - f_data[slice3])
+
+            slice1[axis] = -1
+            slice2[axis] = -1
+            slice3[axis] = -2
+            # 1D equivalent -- out[-1] = (y[-1] - y[-2])
+            out[slice1] = (f_data[slice2] - f_data[slice3])
+
+        # Numerical differentiation: 2nd order edges
+        else:
+
+            slice1[axis] = 0
+            slice2[axis] = 0
+            slice3[axis] = 1
+            slice4[axis] = 2
+            # 1D equivalent -- out[0] = -(3*y[0] - 4*y[1] + y[2]) / 2.0
+            out[slice1] = -(3.0 * f_data[slice2] - 4.0 * f_data[slice3] +
+                            f_data[slice4]) / 2.0
+
+            slice1[axis] = -1
+            slice2[axis] = -1
+            slice3[axis] = -2
+            slice4[axis] = -3
+            # 1D equivalent -- out[-1] = (3*y[-1] - 4*y[-2] + y[-3]) / 2.0
+            out[slice1] = (3.0 * f_data[slice2] - 4.0 * f_data[slice3] +
+                           f_data[slice4]) / 2.0
+
+    # divide by step size
+    out /= voxel_size
+
+    return out
+
+# noinspection PyAbstractClass
+class Gradient(Operator):
+    """Gradient operator for any number of dimension. Calls function
+    'partial_derivative' to calculate each component.
+    """
+
+    def __init__(self, space, voxel_size=(1,), edge_order=2,
+                 zero_padding=True):
+        self.voxel_size = voxel_size
+        self.edge_order = edge_order
+        self.zero_padding = zero_padding
+        super().__init__(domain=space, range=ProductSpace(
+            space, len(voxel_size)), linear=True)
+
+    def _apply(self, rhs, out):
+        """Apply gradient operator to 'rhs' and store result in 'out'.
+
+        >>> from odl import *
+        >>> from utils import ndvolume
+        >>> N = 3
+        >>> n = 10
+        >>> disc = l2_uniform_discretization(L2(IntervalProd(
+        ... [0.]*N, [n]*N)), [n]*N)
+        >>> x = disc.element(ndvolume(n, N, np.int16))
+        >>> print(x.space)
+        >>> A = Gradient(disc, (1.,)*N, zero_padding=True)
+        >>> Ax = A(x)
+        >>> g = A.range.element((1.,)*N)
+        >>> Adg = A.adjoint(g)
+        >>> g.inner(Ax) - x.inner(Adg)
+        0.0
+        >>> B = Divergence(disc, (1.,)*N, zero_padding=True)
+        >>> Bg = B(g)
+        >>> Bdx = B.adjoint(x)
+        """
+        rhs_data = np.asanyarray(rhs)
+        nd = rhs_data.ndim
+
+        dx = self.voxel_size
+        if np.size(dx) == 1:
+            dx = [dx for _ in range(nd)]
+
+        for axis in range(nd):
+            out[axis][:] = partial_derivative(rhs_data, axis, dx[axis],
+                                              self.edge_order,
+                                              self.zero_padding)
+
+    @property
+    def adjoint(self):
+        """Note that, the first argument of the 'Divergence' operator is the
+        space the gradient is computed and not its domain. Thus, 'Divergence'
+        takes the domain of 'Gradient' as space argument.
+        """
+        return -Divergence(self.domain, voxel_size=self.voxel_size,
+                           edge_order=self.edge_order,
+                           zero_padding=self.zero_padding)
+
+
+# noinspection PyAbstractClass
+class Divergence(Operator):
+    """Divergence operator for any number of dimensions. Calls function
+    'partial_derivative' for each component of the input vector. Using
+    'zero_padding' '-Divergence' is the adjoint of 'Gradient'.
+    """
+    def __init__(self, space, voxel_size=(1,), edge_order=2,
+                 zero_padding=True):
+        self.space = space
+        self.voxel_size = voxel_size
+        self.edge_order = edge_order
+        self.zero_padding = zero_padding
+        super().__init__(domain=ProductSpace(space, len(voxel_size)),
+                         range=space, linear=True)
+
+    def _apply(self, rhs, out):
+        """Apply 'Divergence' operator to 'rhs' and store result in 'out'."""
+
+        tmp = np.zeros_like(rhs[0].asarray())
+        for axis in range(tmp.ndim):
+            # tmp += self._partial(rhs[nn].asarray(), nn)
+            tmp += partial_derivative(rhs[axis].asarray(), axis=axis,
+                                      voxel_size=self.voxel_size[axis],
+                                      edge_order=self.edge_order,
+                                      zero_padding=self.zero_padding)
+        out[:] = tmp
+
+    @property
+    def adjoint(self):
+        return -Gradient(self.range, voxel_size=self.voxel_size,
+                         edge_order=self.edge_order,
+                         zero_padding=self.zero_padding)
+
+
+def operator_norm(op, niter=1, x_init=1.0, precision=None, partial=None):
+    """Calulates the norm '||K||_2' of operator 'K' as the largest singular
+    value of 'K' employing the generic power method.  The obtained scalar
+    tends to '||K||_2' as the number of iterations 'niter' increases. Loop
+    is aborted after 'niter' iterations or if consecutive estimates of the
+    norm differ less than 'precision'.
+
+    :param op: continuous linear operator
+    :type niter: int (default 1)
+    :param niter: number of iteration for the generic power method
+    :param x_init: initial non-zero image in the domain of the operator
+    :type precision: float
+    :param precision: abort loop if operator changes less than precision
+    :rtype: float
+    :returns: s
+
+    >>> from odl import *
+    >>> N = 2
+    >>> n = 10
+    >>> disc = l2_uniform_discretization(L2(Cuboid([0.]*N, [n]*N)), [n]*N)
+    >>> x = disc.element(1)
+    >>> op = Gradient(disc, (1,)*N, zero_padding=True)
+    >>> op_norms = StorePartial()
+    >>> op_norm = operator_norm(op, 20, 1.0, partial=op_norms)
+    >>> op_norms.results[-1] - op_norm
+    0.0
+    >>> print('{0:.5f} {1:.5f}'.format(*op_norms.results[-2:]))
+    1.62585 1.63068
+    >>> print('{:.5f}'.format(operator_norm(op, 100, 1.0, precision=1e-5)))
+    1.66184
+    >>> op_norms = StorePartial()
+    >>> prec = 1e-5
+    >>> op_norm = operator_norm(op, 100, 1.0, precision=prec, partial=op_norms)
+    >>> op_norms.results[-1] - op_norms.results[-2] < prec
+    True
+    >>> op_norms.results[-2] - op_norms.results[-3] > prec
+    True
+    >>> op_norm == operator_norm(op, len(op_norms.results), 1.0)
+    True
+    """
+
+    x = op.domain.element(x_init)
+    tmp_ran = op.range.element()
+    s0 = 0
+
+    for _ in range(niter):
+        # x_{n+1} <- K^T K x_n
+        op(x, out=tmp_ran)
+        op.adjoint(tmp_ran, out=x)
+        # x_n <- x_n/||x_n||_2
+        x = x / x.norm()
+
+        # intermediate results
+        if partial or precision is not None:
+            # s <-|| K x ||_2
+            op(x, out=tmp_ran)
+            s = tmp_ran.norm()
+
+        if partial is not None:
+            partial.send(s)
+
+        if precision is not None and niter > 2:
+            if abs(s - s0) < precision:
+                break
+            s0 = s
+
+    # s <-|| K x ||_2
+    op(x, out=tmp_ran)
+    return tmp_ran.norm()
+
+
+def chambolle_pock(op, x, rhs, niter=1, op_norm=None, tau=None, sigma=None,
+                   theta=None, partial=None):
+    """Chambolle-Pock algorithms of first-order primal-dual method for
+    non-smooth convex optimizatoin problems with known saddle point structure.
+
+
+    Parameters
+    ----------
+    :param op: instance of 'Operator' subclass
+    :param op: continuous linear operator with induced norm
+    :param x: odl vector
+    :param rhs: odl vector
+    :type niter: int (default 1)
+    :param niter: number of iterations
+    :type op_norm: float (default: None)
+    :param op_norm: operator norm. If 'None' generic power method is used to
+        calculate the operator norm.
+    :type tau: float (default 1/op_norm)
+    :param tau: step size
+    :type sigma: float (default 1/op_norm)
+    :param sigma: step size
+    :type theta: float (default 1)
+    :param theta: acceleration parameter in [0,1]. theta = 0 corresponds to
+    the Arrow-Hurwicz algorithm.
+    :param partial:
+
+    :return:
+    """
+
+    # step 0
+    u = x
+    ub = u.copy()
+    g = rhs
+
+    # step 1:
+    if op_norm is None:
+        op_norm = operator_norm(op, 20)
+    if tau is None:
+        tau = 0.95 / op_norm
+    if sigma is None:
+        sigma = 0.95 / op_norm
+    if theta is None:
+        theta = 1
+
+    # Reusable temporaries
+    p = op.range.element(0)
+    p_tmp = op.range.element()
+
+    for _ in range(niter):
+        # step 5: p_{n+1} <- (p_n + sigma(A^T ub_n - g)) / (1 + sigma)
+        op(ub, out=p_tmp)
+        p_tmp -= g
+        p_tmp *= sigma
+        p += p_tmp
+        p /= 1+sigma
+
+        # step 6: u_{n+1} <- u_{n} - tau * A^T p_{n+1}
+        # Store current u_n in ub
+        ub = u.copy()
+        op.adjoint(p, out=u)
+        u *= -tau
+        # u_{n+1}
+        u += ub
+
+        if partial is not None:
+            partial.send(u)
+
+        # step 7: ub_{n+1} <- u_{n+1} + theta(u_{n+1} - u_n)
+        ub *= -1
+        ub += u
+        ub *= theta
+        ub += u
+
+    x = u
 
 if __name__ == '__main__':
     from doctest import testmod, NORMALIZE_WHITESPACE
